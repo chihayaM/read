@@ -1100,17 +1100,40 @@ async function loadLocalTxtBooks() {
 
     // 2. 扫描目录，补充 JSON 中没有的书
     try {
+      let dirHtml = null;
       const resp = await fetch('txt/');
       if (resp.ok) {
-        const html = await resp.text();
+        dirHtml = await resp.text();
+      }
+      // GitHub Pages 不支持目录列表，用 API 兜底
+      if (!dirHtml || dirHtml.length < 200) {
+        try {
+          const apiResp = await fetch('https://api.github.com/repos/chihayaM/read/contents/txt');
+          if (apiResp.ok) {
+            const files = await apiResp.json();
+            for (const f of files) {
+              if (f.type !== 'file') continue;
+              const filename = f.name;
+              if (filename.toLowerCase() === 'books.json' || filename.toLowerCase() === 'index.json') continue;
+              if (discovered.some(d => d.file.split('/').pop() === filename)) continue;
+              const ext = filename.split('.').pop().toLowerCase();
+              if (!['txt','md','markdown','log','csv','json','xml','html','htm','fb2','rtf','epub','pdf'].includes(ext)) continue;
+              const meta = jsonMeta[filename];
+              const title = meta ? meta.title : filename.replace(/\.[^.]+$/, '').replace(/ \(.*?\)/g, '').trim();
+              discovered.push({ file: `txt/${filename}`, title, author: meta ? meta.author : '', ext });
+            }
+          }
+        } catch {}
+      }
+      // 普通目录列表解析
+      if (dirHtml && dirHtml.length >= 200) {
         const linkRegex = /href="([^"?][^"]*\.(?:txt|md|markdown|log|csv|json|xml|html|htm|fb2|rtf|epub|pdf))"/gi;
         let match;
-        while ((match = linkRegex.exec(html)) !== null) {
+        while ((match = linkRegex.exec(dirHtml)) !== null) {
           const href = match[1];
           if (href === '../' || href === '..' || href.startsWith('?')) continue;
           const filename = decodeURIComponent(href.replace(/^\//, ''));
           if (filename.toLowerCase() === 'books.json' || filename.toLowerCase() === 'index.json') continue;
-          // 跳过已在 discovered 中的文件
           if (discovered.some(d => d.file.split('/').pop() === filename)) continue;
           const ext = filename.split('.').pop().toLowerCase();
           const meta = jsonMeta[filename];
