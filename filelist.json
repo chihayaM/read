@@ -1,0 +1,11 @@
+{
+  "books": [
+    {
+      "name": "示例书籍 1",
+      "path": "txt/example1.txt",
+      "filename": "example1.txt",
+      "size": 0,
+      "isLocal": true
+    }
+  ]
+}
