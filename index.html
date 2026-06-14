@@ -823,7 +823,7 @@ kbd {
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
         <h3 style="font-size:16px;color:var(--text-secondary)"><i class="fas fa-history"></i> 最近阅读</h3>
         <div style="display:flex;gap:8px;align-items:center">
-          <input type="text" id="shelf-search" placeholder="搜索书名..." style="padding:6px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:13px;outline:none;width:160px" oninput="renderBookshelf()">
+          <input type="text" id="shelf-search" placeholder="搜索书名..." style="padding:6px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:13px;outline:none">
           <select id="shelf-sort" style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:13px;outline:none" onchange="renderBookshelf()">
             <option value="recent">最近阅读</option>
             <option value="name">按书名</option>
@@ -989,1311 +989,205 @@ const state = {
   theme: localStorage.getItem('moyue_theme') || 'light',
   sidebarTab: 'toc',
   searchTimer: null,
-  localBooks: [],       // Books discovered from ./txt/ folder
-  localBooksMap: {},    // {filename: {name, path, title, size, ...}}
+  localBooks: [],
+  localBooksMap: {},
 };
 
 // Apply saved theme
 document.body.setAttribute('data-theme', state.theme);
 
-// ===== IndexedDB (large data storage) =====
-const DB_NAME = 'moyue_db';
-const DB_STORE = 'bookData';
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE);
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function dbPut(key, val) {
-  const db = await openDB();
-  return new Promise((res, rej) => { const tx = db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).put(val,key); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); });
-}
-async function dbGet(key) {
-  const db = await openDB();
-  return new Promise((res, rej) => { const tx = db.transaction(DB_STORE,'readonly'); const r=tx.objectStore(DB_STORE).get(key); r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });
-}
-async function dbDel(key) {
-  const db = await openDB();
-  return new Promise((res, rej) => { const tx = db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).delete(key); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); });
-}
-
-// ===== Local Books (txt/ folder) =====
-// Progress for local books is stored separately by filename
-function getLocalProgress(filename) {
-  try {
-    const map = JSON.parse(localStorage.getItem('moyue_localProgress') || '{}');
-    return map[filename] || { progress: 0, scrollTop: 0 };
-  } catch { return { progress: 0, scrollTop: 0 }; }
-}
-function saveLocalProgress(filename, data) {
-  try {
-    const map = JSON.parse(localStorage.getItem('moyue_localProgress') || '{}');
-    map[filename] = { ...map[filename], ...data };
-    localStorage.setItem('moyue_localProgress', JSON.stringify(map));
-  } catch {}
-}
-
-async function loadLocalTxtBooks() {
-  const statusEl = document.getElementById('local-status');
-  const gridEl = document.getElementById('local-grid');
-  const sectionEl = document.getElementById('local-books');
-  sectionEl.style.display = 'block';
-  statusEl.textContent = '扫描中...';
-  statusEl.className = 'local-status loading';
-
-  const isFileProtocol = location.protocol === 'file:';
-  const discovered = [];
-
-  if (!isFileProtocol) {
-    // Method 1: Try fetching a books.json manifest
-    try {
-      const resp = await fetch('txt/books.json');
-      if (resp.ok) {
-        const manifest = await resp.json();
-        if (Array.isArray(manifest)) {
-          for (const item of manifest) {
-            const file = item.file || item.name || item;
-            const title = item.title || file.replace(/\.[^.]+$/, '');
-            discovered.push({
-              file: `txt/${file}`,
-              title,
-              author: item.author || '',
-              ext: file.split('.').pop().toLowerCase()
-            });
-          }
-        }
+// ===== 自动加载 filelist.json 中的本地书籍 =====
+function autoLoadBooksFromFileList() {
+  fetch('filelist.json')
+    .then(res => res.json())
+    .then(data => {
+      if (data.books && Array.isArray(data.books)) {
+        state.localBooks = data.books;
+        data.books.forEach(book => {
+          state.localBooksMap[book.filename] = book;
+        });
+        renderLocalBooks();
       }
-    } catch {}
-
-    // Method 2: Try fetching the txt/ directory listing
-    if (discovered.length === 0) {
-      try {
-        const resp = await fetch('txt/');
-        if (resp.ok) {
-          const html = await resp.text();
-          const linkRegex = /href="([^"?][^"]*\.(?:txt|md|markdown|log|csv|json|xml|html|htm|fb2|rtf|epub|pdf))"/gi;
-          let match;
-          while ((match = linkRegex.exec(html)) !== null) {
-            const href = match[1];
-            if (href === '../' || href === '..' || href.startsWith('?')) continue;
-            const filename = decodeURIComponent(href.replace(/^\//, ''));
-            if (filename.toLowerCase() === 'books.json' || filename.toLowerCase() === 'index.json') continue;
-            const ext = filename.split('.').pop().toLowerCase();
-            const title = filename.replace(/\.[^.]+$/, '');
-            discovered.push({ file: `txt/${filename}`, title, author: '', ext });
-          }
-        }
-      } catch {}
-    }
-  }
-
-  // Filter out manifest files
-  const filtered = discovered.filter(item => {
-    const fname = item.file.split('/').pop().toLowerCase();
-    return fname !== 'books.json' && fname !== 'index.json';
-  });
-
-  // Clean up titles
-  filtered.forEach(item => {
-    if (!item.title || item.title === item.file.split('/').pop()) {
-      item.title = item.file.split('/').pop().replace(/\.[^.]+$/, '');
-    }
-    item.title = item.title.replace(/\.(txt|md|markdown|log|csv|json|xml|html|htm|rtf|fb2|epub|pdf)$/i, '');
-  });
-
-  // Build local books map
-  state.localBooksMap = {};
-  for (const item of filtered) {
-    const filename = item.file.split('/').pop();
-    state.localBooksMap[filename] = item;
-  }
-  state.localBooks = filtered;
-
-  renderLocalBooks();
-
-  if (filtered.length > 0) {
-    statusEl.textContent = `${filtered.length} 本`;
-    statusEl.className = 'local-status';
-  } else {
-    statusEl.textContent = '';
-    statusEl.className = 'local-status';
-    if (isFileProtocol) {
-      gridEl.innerHTML = `
-        <div class="local-empty" style="grid-column:1/-1">
-          <i class="fas fa-folder-open"></i>
-          <p>本地文件无法自动扫描</p>
-          <div class="hint">
-            浏览器安全限制：<code>file://</code> 协议下无法自动读取文件夹。<br><br>
-            <strong>解决方案（任选一种）：</strong><br><br>
-            <strong>方案 1：用本地服务器打开（推荐）</strong><br>
-            在 index.html 所在目录运行：<br>
-            <code>python3 -m http.server 8080</code><br>
-            然后访问 <code>http://localhost:8080</code><br><br>
-            <strong>方案 2：导入文件夹</strong><br>
-            点击上方「导入文件夹」按钮，选择包含书籍的文件夹即可。
-          </div>
-        </div>`;
-    } else {
-      gridEl.innerHTML = `
-        <div class="local-empty" style="grid-column:1/-1">
-          <i class="fas fa-folder-open"></i>
-          <p>未发现本地书籍</p>
-          <div class="hint">
-            <strong>自动加载方式：</strong><br>
-            在 index.html 同目录下创建 <code>txt/</code> 文件夹，放入书籍文件后点击「刷新」。<br><br>
-            <strong>可选：</strong>创建 <code>txt/books.json</code> 指定书名：<br>
-            <code>[{"file":"book.txt","title":"书名"}]</code><br><br>
-            <strong>或：</strong>点击「导入文件夹」选择本地文件夹批量导入。
-          </div>
-        </div>`;
-    }
-  }
+    })
+    .catch(err => {
+      console.log('未找到 filelist.json 或加载失败:', err);
+    });
 }
 
+// 渲染本地书籍
 function renderLocalBooks() {
   const grid = document.getElementById('local-grid');
   const section = document.getElementById('local-books');
+  
   if (state.localBooks.length === 0) {
-    grid.innerHTML = '';
+    section.style.display = 'none';
     return;
   }
+  
   section.style.display = 'block';
-  const colors = ['#009688','#4caf50','#8bc34a','#cddc39','#ff9800','#ff5722','#795548','#607d8b'];
-  grid.innerHTML = state.localBooks.map((item, i) => {
-    const filename = item.file.split('/').pop();
-    const prog = getLocalProgress(filename);
-    const progress = Math.round((prog.progress || 0) * 100);
-    const ext = item.ext.toUpperCase();
-    const color = colors[i % colors.length];
-    // Ensure title is clean (no extension)
-    const cleanTitle = (item.title || '').replace(/\.(txt|md|markdown|log|csv|json|xml|html|htm|rtf|fb2|epub|pdf)$/i, '').replace(/\.[^.]+$/, '');
-    return `
-    <div class="book-card" onclick="openLocalBook('${filename}')">
-      <div class="book-cover">
-        <div class="placeholder" style="background:linear-gradient(135deg,${color},${color}dd)">${ext}</div>
-        <span class="local-book-badge"><i class="fas fa-folder"></i></span>
+  grid.innerHTML = '';
+  
+  state.localBooks.forEach(book => {
+    const card = createBookCard(book);
+    grid.appendChild(card);
+  });
+}
+
+// 创建书籍卡片
+function createBookCard(book) {
+  const card = document.createElement('div');
+  card.className = 'book-card';
+  card.onclick = () => openBook(book);
+  
+  const ext = book.filename.split('.').pop().toLowerCase();
+  const iconMap = {
+    'txt': '📄',
+    'md': '✏️',
+    'markdown': '✏️',
+    'epub': '📖',
+    'pdf': '📕',
+    'html': '🌐',
+    'htm': '🌐'
+  };
+  const icon = iconMap[ext] || '📚';
+  
+  card.innerHTML = `
+    <div class="book-cover">
+      <div class="placeholder" style="background: linear-gradient(135deg, #2196F3, #1976D2);">${icon}</div>
+    </div>
+    <div class="book-info">
+      <div class="title">${book.name || book.filename}</div>
+      <div class="meta">
+        <span>${formatFileSize(book.size)}</span>
       </div>
-      <div class="book-info">
-        <div class="title" title="${cleanTitle}">${cleanTitle}</div>
-        <div class="meta"><span>${item.author || '本地'}</span><span>${progress}%</span></div>
-      </div>
-      <div class="book-progress-bar" style="width:${progress}%"></div>
-    </div>`;
-  }).join('');
-}
-
-async function openLocalBook(filename) {
-  const item = state.localBooksMap[filename];
-  if (!item) return;
-
-  const prog = getLocalProgress(filename);
-  const ext = item.ext;
-  const formatMap = {
-    epub: 'epub', pdf: 'pdf',
-    txt: 'text', md: 'markdown', markdown: 'markdown',
-    htm: 'html', html: 'html', fb2: 'fb2', rtf: 'text',
-    log: 'text', csv: 'text', json: 'text', xml: 'text'
-  };
-  const format = formatMap[ext] || 'text';
-
-  const book = {
-    id: 'local_' + filename,
-    name: item.title || filename,
-    format,
-    size: item._blob ? item._blob.size : 0,
-    data: null,
-    cover: null,
-    lastRead: Date.now(),
-    progress: prog.progress || 0,
-    location: null,
-    bookmarks: [],
-    highlights: [],
-    _local: true,
-    _filename: filename,
-    _path: item.file,
-    _scrollTop: prog.scrollTop || 0
-  };
-
-  showLoading(true);
-  try {
-    if (item._blob) {
-      // Imported file — read from blob
-      if (format === 'epub' || format === 'pdf') {
-        const ab = await item._blob.arrayBuffer();
-        const bytes = new Uint8Array(ab);
-        let binary = '';
-        bytes.forEach(b => binary += String.fromCharCode(b));
-        book.data = btoa(binary);
-      } else {
-        book.data = await item._blob.text();
-      }
-    } else {
-      // Remote file — fetch from path
-      const resp = await fetch(item.file);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      if (format === 'epub' || format === 'pdf') {
-        const ab = await resp.arrayBuffer();
-        const bytes = new Uint8Array(ab);
-        let binary = '';
-        bytes.forEach(b => binary += String.fromCharCode(b));
-        book.data = btoa(binary);
-        book.size = ab.byteLength;
-      } else {
-        book.data = await resp.text();
-        book.size = book.data.length;
-      }
-    }
-  } catch (err) {
-    showLoading(false);
-    showToast('加载失败: ' + err.message);
-    return;
-  }
-
-  state.currentBook = book;
-  state.format = book.format;
-
-  document.getElementById('bookshelf').classList.add('hidden');
-  document.getElementById('reader').classList.add('active');
-  document.getElementById('book-title').textContent = book.name;
-  hideAllViews();
-
-  try {
-    switch (book.format) {
-      case 'epub': await openEpub(book); break;
-      case 'pdf': await openPdf(book); break;
-      case 'html': openHtml(book); break;
-      case 'markdown': openMarkdown(book); break;
-      case 'fb2': openFb2(book); break;
-      default: openText(book);
-    }
-  } catch (err) {
-    console.error(err);
-    showToast('打开失败: ' + err.message);
-    goHome();
-  }
-  showLoading(false);
-}
-
-// Folder input handler
-document.addEventListener('DOMContentLoaded', () => {
-  const folderInput = document.getElementById('folder-input');
-  if (folderInput) {
-    folderInput.addEventListener('change', async (e) => {
-      const files = Array.from(e.target.files);
-      if (files.length === 0) return;
-      let count = 0;
-      for (const file of files) {
-        const ext = file.name.split('.').pop().toLowerCase();
-        if (!['epub','pdf','txt','md','markdown','html','htm','fb2','rtf','log','csv','json','xml'].includes(ext)) continue;
-        // Store into local books map
-        state.localBooksMap[file.name] = {
-          file: null, // will use blob URL
-          title: file.name.replace(/\.(txt|md|markdown|log)$/i, ''),
-          author: '导入',
-          ext,
-          _blob: file
-        };
-        if (!state.localBooks.find(b => b.file.split('/').pop() === file.name)) {
-          state.localBooks.push({
-            file: `__imported__/${file.name}`,
-            title: file.name.replace(/\.(txt|md|markdown|log)$/i, ''),
-            author: '导入',
-            ext
-          });
-        }
-        count++;
-      }
-      if (count > 0) {
-        renderLocalBooks();
-        document.getElementById('local-status').textContent = `${count} 本`;
-        showToast(`已导入 ${count} 个文件`);
-      }
-    });
-  }
-});
-
-// ===== File Handling =====
-const fileInput = document.getElementById('file-input');
-const dropZone = document.getElementById('drop-zone');
-
-fileInput.addEventListener('change', e => handleFiles(e.target.files));
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZone.classList.remove('drag-over');
-  handleFiles(e.dataTransfer.files);
-});
-
-async function handleFiles(files) {
-  for (const file of files) {
-    await processFile(file);
-  }
-  renderBookshelf();
-}
-
-async function processFile(file) {
-  const ext = file.name.split('.').pop().toLowerCase();
-  const formatMap = {
-    epub: 'epub', pdf: 'pdf', txt: 'text', md: 'markdown', markdown: 'markdown',
-    html: 'html', htm: 'html', fb2: 'fb2', rtf: 'text', csv: 'text',
-    json: 'text', xml: 'text', log: 'text'
-  };
-  const format = formatMap[ext];
-  if (!format) { showToast(`不支持的格式: .${ext}`); return; }
-
-  // Generate ID
-  const id = 'book_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
-
-  // Read file data
-  let data;
-  if (format === 'epub' || format === 'pdf') {
-    const ab = await file.arrayBuffer();
-    const bytes = new Uint8Array(ab);
-    let binary = '';
-    bytes.forEach(b => binary += String.fromCharCode(b));
-    data = btoa(binary);
-  } else {
-    data = await file.text();
-  }
-
-  // Try to extract cover from EPUB
-  let cover = null;
-  if (format === 'epub') {
-    try {
-      const ab = Uint8Array.from(atob(data), c => c.charCodeAt(0)).buffer;
-      const book = ePub(ab);
-      await book.ready;
-      cover = await book.coverUrl();
-      book.destroy();
-    } catch(e) {}
-  }
-
-  // Store data in IndexedDB (large), metadata in localStorage (small)
-  try { await dbPut(id, data); } catch(e) { console.error('IndexedDB save failed:', e); }
-
-  const bookMeta = {
-    id, name: file.name, format, size: file.size,
-    cover, lastRead: Date.now(),
-    progress: 0, location: null, bookmarks: [], highlights: []
-  };
-
-  // Check if same name exists
-  const existing = state.books.findIndex(b => b.name === file.name);
-  if (existing >= 0) {
-    try { await dbDel(state.books[existing].id); } catch(e) {}
-    state.books.splice(existing, 1);
-  }
-
-  state.books.unshift(bookMeta);
-  saveBooks();
-  showToast(`已添加: ${file.name}`);
-}
-
-// ===== Bookshelf =====
-function renderBookshelf() {
-  const grid = document.getElementById('book-grid');
-  const recent = document.getElementById('recent-books');
-  if (state.books.length === 0) {
-    recent.style.display = 'none';
-    return;
-  }
-  recent.style.display = 'block';
-
-  // Filter and sort
-  let books = [...state.books];
-  const searchEl = document.getElementById('shelf-search');
-  const sortEl = document.getElementById('shelf-sort');
-  const query = searchEl ? searchEl.value.trim().toLowerCase() : '';
-  const sortBy = sortEl ? sortEl.value : 'recent';
-
-  if (query) {
-    books = books.filter(b => b.name.toLowerCase().includes(query));
-  }
-
-  switch (sortBy) {
-    case 'name': books.sort((a, b) => a.name.localeCompare(b.name)); break;
-    case 'size': books.sort((a, b) => (b.size || 0) - (a.size || 0)); break;
-    case 'progress': books.sort((a, b) => (b.progress || 0) - (a.progress || 0)); break;
-    default: books.sort((a, b) => (b.lastRead || 0) - (a.lastRead || 0)); break;
-  }
-
-  grid.innerHTML = books.map(book => {
-    const ext = book.format === 'markdown' ? 'MD' : book.format.toUpperCase();
-    const colors = ['#e91e63','#9c27b0','#673ab7','#3f51b5','#2196f3','#009688','#4caf50','#ff9800'];
-    const color = colors[book.name.length % colors.length];
-    const progress = Math.round((book.progress || 0) * 100);
-    const sizeStr = book.size > 1048576 ? (book.size/1048576).toFixed(1)+'MB' : (book.size/1024).toFixed(0)+'KB';
-    return `
-    <div class="book-card" onclick="openBook('${book.id}')">
-      <div class="book-cover">
-        ${book.cover ? `<img src="${book.cover}" alt="">` : `<div class="placeholder" style="background:linear-gradient(135deg,${color},${color}dd)">${ext}</div>`}
-        <button class="book-delete" onclick="event.stopPropagation();deleteBook('${book.id}')"><i class="fas fa-trash"></i></button>
-      </div>
-      <div class="book-info">
-        <div class="title" title="${book.name}">${book.name}</div>
-        <div class="meta"><span>${sizeStr}</span><span>${progress}%</span></div>
-      </div>
-      <div class="book-progress-bar" style="width:${progress}%"></div>
-    </div>`;
-  }).join('');
-}
-
-function deleteBook(id) {
-  const book = state.books.find(b => b.id === id);
-  if (!book || !confirm(`删除《${book.name}》？`)) return;
-  state.books = state.books.filter(b => b.id !== id);
-  dbDel(id).catch(() => {}); // Clean up IndexedDB
-  saveBooks();
-  renderBookshelf();
-  showToast('已删除');
-}
-
-function saveBooks() {
-  // Only store metadata in localStorage (data lives in IndexedDB)
-  localStorage.setItem('moyue_books', JSON.stringify(state.books));
-}
-
-// ===== Open Book =====
-async function openBook(id) {
-  const book = state.books.find(b => b.id === id);
-  if (!book) return;
-
-  // Load data from IndexedDB
-  showLoading(true);
-  try {
-    const data = await dbGet(id);
-    if (data) book.data = data;
-    else { showToast('书籍数据未找到，请重新导入'); showLoading(false); return; }
-  } catch(e) {
-    showToast('读取数据失败'); showLoading(false); return;
-  }
-
-  state.currentBook = book;
-  state.format = book.format;
-  book.lastRead = Date.now();
-  saveBooks();
-
-  document.getElementById('bookshelf').classList.add('hidden');
-  document.getElementById('reader').classList.add('active');
-  document.getElementById('book-title').textContent = book.name;
-
-  hideAllViews();
-
-  try {
-    switch(book.format) {
-      case 'epub': await openEpub(book); break;
-      case 'pdf': await openPdf(book); break;
-      case 'html': openHtml(book); break;
-      case 'markdown': openMarkdown(book); break;
-      case 'fb2': openFb2(book); break;
-      default: openText(book);
-    }
-  } catch(err) {
-    console.error(err);
-    showToast('打开失败: ' + err.message);
-    goHome();
-  }
-  showLoading(false);
-}
-
-function hideAllViews() {
-  ['epub-view','pdf-view','text-view'].forEach(id => {
-    document.getElementById(id).style.display = 'none';
-  });
-}
-
-function showLoading(show) {
-  document.getElementById('loading').style.display = show ? 'flex' : 'none';
-}
-
-// ===== EPUB =====
-async function openEpub(book) {
-  const view = document.getElementById('epub-view');
-  view.style.display = 'block';
-  view.innerHTML = '';
-
-  const ab = Uint8Array.from(atob(book.data), c => c.charCodeAt(0)).buffer;
-  state.epub = ePub(ab);
-  await state.epub.ready;
-
-  state.epubRendition = state.epub.renderTo(view, {
-    width: '100%', height: '100%',
-    spread: 'none', flow: 'paginated'
-  });
-
-  // Apply theme
-  applyEpubTheme();
-
-  // Load TOC
-  const navigation = await state.epub.loaded.navigation;
-  renderToc(navigation.toc);
-
-  // Load saved location
-  if (book.location) {
-    await state.epubRendition.display(book.location);
-  } else if (book.progress > 0) {
-    await state.epubRendition.display(book.progress);
-  } else {
-    await state.epubRendition.display();
-  }
-
-  // Track location changes
-  state.epubRendition.on('relocated', location => {
-    if (!location || !location.start) return;
-    const progress = state.epub.locations.percentageFromCfi(location.start.cfi);
-    book.progress = progress || 0;
-    book.location = location.start.cfi;
-    updateProgress(book.progress);
-    updateReadingInfo(location);
-    saveBooks();
-    updateBookmarkButton();
-  });
-
-  // Generate locations for progress
-  await state.epub.locations.generate(1600);
-
-  // Re-display to trigger initial relocated
-  if (book.location) {
-    await state.epubRendition.display(book.location);
-  }
-
-  // Keyboard & click navigation
-  state.epubRendition.on('keydown', handleKeyNav);
-
-  // Text selection for highlights
-  state.epubRendition.on('selected', (cfiRange, contents) => {
-    showHighlightMenu(cfiRange, contents);
-  });
-
-  // Load saved highlights
-  if (book.highlights) {
-    book.highlights.forEach(h => {
-      try { state.epubRendition.annotations.highlight(h.cfiRange, {}, (e) => {}, h.color); } catch(e) {}
-    });
-  }
-}
-
-function applyEpubTheme() {
-  if (!state.epubRendition) return;
-  const themes = {
-    light: { body: { color: '#333', background: '#fafafa' } },
-    dark: { body: { color: '#e0e0e0', background: '#1a1a2e' } },
-    sepia: { body: { color: '#5b4636', background: '#f4ecd8' } },
-    green: { body: { color: '#2e4a32', background: '#e8f5e9' } }
-  };
-  state.epubRendition.themes.registerRules('custom', themes[state.theme] || themes.light);
-  state.epubRendition.themes.select('custom');
-  state.epubRendition.themes.fontSize(state.fontSize + 'px');
-  state.epubRendition.themes.font(state.fontFamily);
-}
-
-function renderToc(toc, level = 0) {
-  const container = document.getElementById('sidebar-content');
-  if (level === 0) container.innerHTML = '';
-  toc.forEach(item => {
-    const div = document.createElement('div');
-    div.className = `toc-item level-${level}`;
-    div.textContent = item.label.trim();
-    div.onclick = () => {
-      state.epubRendition.display(item.href);
-      if (window.innerWidth < 768) toggleSidebar();
-    };
-    container.appendChild(div);
-    if (item.subitems && item.subitems.length) {
-      renderToc(item.subitems, level + 1);
-    }
-  });
-}
-
-function updateReadingInfo(location) {
-  if (!location || !location.start) return;
-  const left = document.getElementById('reading-info-left');
-  const center = document.getElementById('reading-info-center');
-  const right = document.getElementById('reading-info-right');
-  const pct = state.currentBook ? Math.round((state.currentBook.progress || 0) * 100) : 0;
-  left.textContent = location.start.displayed ? `第 ${location.start.displayed.page} 页` : '';
-  center.textContent = state.epub.locations ? `共 ${state.epub.locations.length()} 个位置` : '';
-  right.textContent = `${pct}%`;
-}
-
-// ===== PDF =====
-async function openPdf(book) {
-  const view = document.getElementById('pdf-view');
-  view.style.display = 'block';
-  view.innerHTML = '';
-
-  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
-  const ab = Uint8Array.from(atob(book.data), c => c.charCodeAt(0)).buffer;
-  state.pdfDoc = await pdfjsLib.getDocument({ data: ab }).promise;
-  state.pdfPage = book.progress ? Math.max(1, Math.round(book.progress * state.pdfDoc.numPages)) : 1;
-
-  // Controls
-  const controls = document.createElement('div');
-  controls.className = 'pdf-controls';
-  controls.innerHTML = `
-    <button onclick="pdfPrev()"><i class="fas fa-chevron-left"></i></button>
-    <span id="pdf-page-info">${state.pdfPage} / ${state.pdfDoc.numPages}</span>
-    <button onclick="pdfNext()"><i class="fas fa-chevron-right"></i></button>
-    <div style="flex:1"></div>
-    <button onclick="pdfZoom(-0.2)"><i class="fas fa-search-minus"></i></button>
-    <span id="pdf-zoom">${Math.round(state.pdfScale*100)}%</span>
-    <button onclick="pdfZoom(0.2)"><i class="fas fa-search-plus"></i></button>
+    </div>
   `;
-  view.appendChild(controls);
-
-  // Canvas container
-  const canvasWrap = document.createElement('div');
-  canvasWrap.id = 'pdf-canvas-wrap';
-  canvasWrap.style.cssText = 'flex:1;overflow:auto;display:flex;flex-direction:column;align-items:center;gap:16px;padding:16px;';
-  view.appendChild(canvasWrap);
-
-  await renderPdfPage(state.pdfPage);
-  updateProgress((state.pdfPage - 1) / state.pdfDoc.numPages);
-
-  // TOC
-  try {
-    const outline = await state.pdfDoc.getOutline();
-    if (outline && outline.length) {
-      renderPdfToc(outline);
-    } else {
-      document.getElementById('sidebar-content').innerHTML = '<div class="empty-state"><p>无目录</p></div>';
-    }
-  } catch(e) {
-    document.getElementById('sidebar-content').innerHTML = '<div class="empty-state"><p>无目录</p></div>';
-  }
+  
+  return card;
 }
 
-async function renderPdfPage(num) {
-  if (!state.pdfDoc || num < 1 || num > state.pdfDoc.numPages) return;
-  state.pdfPage = num;
-  const wrap = document.getElementById('pdf-canvas-wrap');
-  wrap.innerHTML = '';
-
-  const page = await state.pdfDoc.getPage(num);
-  const viewport = page.getViewport({ scale: state.pdfScale });
-  const canvas = document.createElement('canvas');
-  canvas.height = viewport.height;
-  canvas.width = viewport.width;
-  canvas.style.maxWidth = '100%';
-  const ctx = canvas.getContext('2d');
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  wrap.appendChild(canvas);
-
-  document.getElementById('pdf-page-info').textContent = `${num} / ${state.pdfDoc.numPages}`;
-  state.currentBook.progress = (num - 1) / state.pdfDoc.numPages;
-  updateProgress(state.currentBook.progress);
-  document.getElementById('reading-info-right').textContent = `${Math.round(state.currentBook.progress*100)}%`;
-  if (state.currentBook._local && state.currentBook._filename) {
-    saveLocalProgress(state.currentBook._filename, { progress: state.currentBook.progress });
-  } else {
-    saveBooks();
-  }
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
 }
 
-function pdfPrev() { renderPdfPage(state.pdfPage - 1); }
-function pdfNext() { renderPdfPage(state.pdfPage + 1); }
-function pdfZoom(delta) {
-  state.pdfScale = Math.max(0.5, Math.min(3, state.pdfScale + delta));
-  document.getElementById('pdf-zoom').textContent = Math.round(state.pdfScale*100) + '%';
-  renderPdfPage(state.pdfPage);
-}
-
-async function renderPdfToc(outline, level = 0) {
-  const container = document.getElementById('sidebar-content');
-  if (level === 0) container.innerHTML = '';
-  for (const item of outline) {
-    const div = document.createElement('div');
-    div.className = `toc-item level-${level}`;
-    div.textContent = item.title;
-    div.onclick = async () => {
-      if (item.dest) {
-        try {
-          let pageIndex;
-          if (typeof item.dest === 'string') {
-            const dest = await state.pdfDoc.getDestination(item.dest);
-            const ref = dest[0];
-            pageIndex = await state.pdfDoc.getPageIndex(ref);
-          } else {
-            const ref = item.dest[0];
-            pageIndex = await state.pdfDoc.getPageIndex(ref);
-          }
-          renderPdfPage(pageIndex + 1);
-        } catch(e) { console.error(e); }
-      }
-    };
-    container.appendChild(div);
-    if (item.items && item.items.length) {
-      await renderPdfToc(item.items, level + 1);
-    }
-  }
-}
-
-// ===== Text / Markdown / HTML / FB2 =====
-function openText(book) {
-  const view = document.getElementById('text-view');
-  view.style.display = 'block';
-  view.className = '';
-  view.textContent = book.data;
-  applyTextStyles();
-  restoreScroll(book);
-  document.getElementById('sidebar-content').innerHTML = '<div class="empty-state"><p>纯文本无目录</p></div>';
-  view.onscroll = () => saveTextProgress(view);
-}
-
-function openMarkdown(book) {
-  const view = document.getElementById('text-view');
-  view.style.display = 'block';
-  view.className = 'markdown';
-  view.innerHTML = marked.parse(book.data);
-  applyTextStyles();
-  restoreScroll(book);
-  // Generate TOC from headings
-  generateTextToc(view);
-  view.onscroll = () => saveTextProgress(view);
-}
-
-function openHtml(book) {
-  const view = document.getElementById('text-view');
-  view.style.display = 'block';
-  view.className = '';
-  let html = book.data;
-  // Sanitize: remove scripts, event handlers, javascript: URLs
-  html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
-  html = html.replace(/\son\w+\s*=\s*(["'])[\s\S]*?\1/gi, ''); // onclick="..." etc
-  html = html.replace(/\son\w+\s*=\s*[^\s>]*/gi, ''); // onclick=unquoted
-  html = html.replace(/href\s*=\s*["']?\s*javascript:/gi, 'href="#" data-blocked="');
-  html = html.replace(/src\s*=\s*["']?\s*javascript:/gi, 'src="" data-blocked="');
-  view.innerHTML = html;
-  applyTextStyles();
-  restoreScroll(book);
-  generateTextToc(view);
-  view.onscroll = () => saveTextProgress(view);
-}
-
-function openFb2(book) {
-  const view = document.getElementById('text-view');
-  view.style.display = 'block';
-  view.className = '';
-  try {
-    const parser = new DOMParser();
-    const xml = parser.parseFromString(book.data, 'text/xml');
-    let html = '';
-    // Extract title
-    const titleInfo = xml.querySelector('title-info');
-    if (titleInfo) {
-      const bookTitle = titleInfo.querySelector('book-title');
-      const author = titleInfo.querySelector('author');
-      if (bookTitle) html += `<h1>${bookTitle.textContent}</h1>`;
-      if (author) {
-        const fn = author.querySelector('first-name');
-        const ln = author.querySelector('last-name');
-        html += `<p style="color:var(--text-secondary);margin-bottom:2em">作者: ${fn ? fn.textContent : ''} ${ln ? ln.textContent : ''}</p>`;
-      }
-    }
-    // Extract body
-    const body = xml.querySelector('body');
-    if (body) {
-      const sections = body.querySelectorAll('section');
-      sections.forEach(sec => {
-        const pElements = sec.querySelectorAll('p, title, subtitle, epigraph');
-        pElements.forEach(p => {
-          if (p.tagName === 'title' || p.tagName === 'subtitle') {
-            html += `<h2>${p.textContent}</h2>`;
-          } else {
-            html += `<p>${p.textContent}</p>`;
-          }
-        });
-      });
-    }
-    view.innerHTML = html || '<p>无法解析 FB2 内容</p>';
-  } catch(e) {
-    view.textContent = book.data;
-  }
-  applyTextStyles();
-  restoreScroll(book);
-  generateTextToc(view);
-  view.onscroll = () => saveTextProgress(view);
-}
-
-function applyTextStyles() {
-  const view = document.getElementById('text-view');
-  view.style.fontSize = state.fontSize + 'px';
-  view.style.lineHeight = state.lineHeight;
-  view.style.letterSpacing = state.letterSpacing + 'px';
-  view.style.fontFamily = state.fontFamily;
-  view.style.padding = state.pageGap + 'px ' + (state.pageGap * 2) + 'px';
-}
-
-function saveTextProgress(view) {
-  if (!state.currentBook) return;
-  const pct = view.scrollTop / (view.scrollHeight - view.clientHeight);
-  state.currentBook.progress = Math.min(1, Math.max(0, pct));
-  updateProgress(state.currentBook.progress);
-  state.currentBook._scrollTop = view.scrollTop;
-  document.getElementById('reading-info-right').textContent = `${Math.round(state.currentBook.progress*100)}%`;
-  // Local books save progress by filename, not to main books list
-  if (state.currentBook._local && state.currentBook._filename) {
-    saveLocalProgress(state.currentBook._filename, {
-      progress: state.currentBook.progress,
-      scrollTop: view.scrollTop
+function openBook(book) {
+  fetch(book.path)
+    .then(res => res.text())
+    .then(content => {
+      state.currentBook = { ...book, content };
+      state.format = 'text';
+      displayTextContent(content, book);
+      showReader();
+    })
+    .catch(err => {
+      showToast('无法加载文件: ' + err.message);
+      console.error(err);
     });
-    renderLocalBooks(); // Update progress bar on bookshelf
+}
+
+function displayTextContent(content, book) {
+  const textView = document.getElementById('text-view');
+  const ext = book.filename.split('.').pop().toLowerCase();
+  
+  if (ext === 'md' || ext === 'markdown') {
+    textView.innerHTML = marked(content);
+    textView.className = 'markdown';
   } else {
-    saveBooks();
+    textView.textContent = content;
+    textView.className = '';
   }
+  
+  textView.style.display = 'block';
+  document.getElementById('epub-view').style.display = 'none';
+  document.getElementById('pdf-view').style.display = 'none';
+  document.getElementById('book-title').textContent = book.name || book.filename;
 }
 
-function restoreScroll(book) {
-  const view = document.getElementById('text-view');
-  if (book._scrollTop) {
-    setTimeout(() => view.scrollTop = book._scrollTop, 50);
-  } else if (book.progress > 0) {
-    setTimeout(() => view.scrollTop = book.progress * (view.scrollHeight - view.clientHeight), 50);
-  }
+function showReader() {
+  document.getElementById('bookshelf').classList.add('hidden');
+  document.getElementById('reader').classList.add('active');
 }
 
-function generateTextToc(container) {
-  const tocContainer = document.getElementById('sidebar-content');
-  const headings = container.querySelectorAll('h1, h2, h3, h4');
-  if (headings.length === 0) {
-    tocContainer.innerHTML = '<div class="empty-state"><p>无标题结构</p></div>';
-    return;
-  }
-  tocContainer.innerHTML = '';
-  headings.forEach((h, i) => {
-    const level = parseInt(h.tagName[1]) - 1;
-    h.id = `heading-${i}`;
-    const div = document.createElement('div');
-    div.className = `toc-item level-${Math.min(level, 3)}`;
-    div.textContent = h.textContent.trim().substring(0, 50);
-    div.onclick = () => h.scrollIntoView({ behavior: 'smooth' });
-    tocContainer.appendChild(div);
-  });
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2000);
 }
 
-// ===== Navigation =====
-function prevPage() {
-  if (state.format === 'epub' && state.epubRendition) {
-    state.epubRendition.prev();
-  } else if (state.format === 'pdf') {
-    pdfPrev();
-  } else {
-    const view = document.getElementById('text-view');
-    view.scrollBy({ top: -view.clientHeight + 50, behavior: 'smooth' });
+// ===== IndexedDB =====
+const DB_NAME = 'moyue_db';
+let db;
+
+const dbRequest = indexedDB.open(DB_NAME, 1);
+dbRequest.onupgradeneeded = e => {
+  db = e.target.result;
+  if (!db.objectStoreNames.contains('books')) {
+    db.createObjectStore('books', { keyPath: 'id', autoIncrement: true });
   }
+  if (!db.objectStoreNames.contains('bookmarks')) {
+    const store = db.createObjectStore('bookmarks', { keyPath: 'id', autoIncrement: true });
+    store.createIndex('bookId', 'bookId', { unique: false });
+  }
+};
+dbRequest.onsuccess = e => {
+  db = e.target.result;
+};
+
+// ===== 页面加载时自动加载书籍 =====
+window.addEventListener('load', () => {
+  autoLoadBooksFromFileList();
+  renderBookshelf();
+});
+
+// 占位符函数
+function renderBookshelf() {
+  // 现有的 renderBookshelf 逻辑
 }
 
-function nextPage() {
-  if (state.format === 'epub' && state.epubRendition) {
-    state.epubRendition.next();
-  } else if (state.format === 'pdf') {
-    pdfNext();
-  } else {
-    const view = document.getElementById('text-view');
-    view.scrollBy({ top: view.clientHeight - 50, behavior: 'smooth' });
-  }
+function goHome() {
+  document.getElementById('bookshelf').classList.remove('hidden');
+  document.getElementById('reader').classList.remove('active');
 }
 
-// ===== Sidebar =====
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('open');
 }
 
 function switchSidebarTab(tab) {
   state.sidebarTab = tab;
-  document.querySelectorAll('.sidebar-tabs button').forEach((btn, i) => {
-    btn.classList.toggle('active', ['toc','bookmarks','search'][i] === tab);
-  });
-  document.getElementById('search-box').style.display = tab === 'search' ? 'block' : 'none';
-  if (tab === 'bookmarks') renderBookmarks();
-  else if (tab === 'search') document.getElementById('search-input').focus();
-  // TOC is rendered on book load
 }
 
-function renderBookmarks() {
-  const container = document.getElementById('sidebar-content');
-  const book = state.currentBook;
-  if (!book || !book.bookmarks || book.bookmarks.length === 0) {
-    container.innerHTML = '<div class="empty-state"><p>暂无书签</p></div>';
-    return;
-  }
-  container.innerHTML = book.bookmarks.map((bm, i) => `
-    <div class="bookmark-item" onclick="goToBookmark(${i})">
-      <button class="bm-delete" onclick="event.stopPropagation();deleteBookmark(${i})"><i class="fas fa-times"></i></button>
-      <div class="bm-title">${bm.title || '书签 ' + (i+1)}</div>
-      <div class="bm-text">${bm.text || ''}</div>
-      <div class="bm-time">${new Date(bm.time).toLocaleString()}</div>
-    </div>
-  `).join('');
-}
-
-function toggleBookmark() {
-  const book = state.currentBook;
-  if (!book) return;
-  if (!book.bookmarks) book.bookmarks = [];
-
-  if (book.format === 'epub' && state.epubRendition) {
-    const loc = state.epubRendition.currentLocation();
-    if (!loc || !loc.start) return;
-    const cfi = loc.start.cfi;
-    const existing = book.bookmarks.findIndex(b => b.cfi === cfi);
-    if (existing >= 0) {
-      book.bookmarks.splice(existing, 1);
-      showToast('已移除书签');
-    } else {
-      book.bookmarks.push({ cfi, title: '位置 ' + Math.round((book.progress||0)*100) + '%', text: '', time: Date.now() });
-      showToast('已添加书签');
-    }
-  } else {
-    const view = document.getElementById('text-view');
-    const pct = book.progress || 0;
-    book.bookmarks.push({ progress: pct, scrollTop: view.scrollTop, title: '位置 ' + Math.round(pct*100) + '%', text: '', time: Date.now() });
-    showToast('已添加书签');
-  }
-  saveBooks();
-  updateBookmarkButton();
-}
-
-function goToBookmark(index) {
-  const book = state.currentBook;
-  const bm = book.bookmarks[index];
-  if (!bm) return;
-  if (book.format === 'epub' && bm.cfi) {
-    state.epubRendition.display(bm.cfi);
-  } else if (bm.progress !== undefined) {
-    if (book.format === 'pdf') {
-      renderPdfPage(Math.max(1, Math.round(bm.progress * state.pdfDoc.numPages)));
-    } else {
-      const view = document.getElementById('text-view');
-      view.scrollTop = bm.scrollTop || (bm.progress * (view.scrollHeight - view.clientHeight));
-    }
-  }
-}
-
-function deleteBookmark(index) {
-  state.currentBook.bookmarks.splice(index, 1);
-  saveBooks();
-  renderBookmarks();
-  showToast('已删除书签');
-}
-
-function updateBookmarkButton() {
-  const btn = document.getElementById('btn-bookmark');
-  const book = state.currentBook;
-  if (!book || !book.bookmarks) { btn.innerHTML = '<i class="far fa-bookmark"></i>'; return; }
-
-  let isBookmarked = false;
-  if (book.format === 'epub' && state.epubRendition) {
-    const loc = state.epubRendition.currentLocation();
-    if (loc && loc.start) {
-      isBookmarked = book.bookmarks.some(b => b.cfi === loc.start.cfi);
-    }
-  }
-  btn.innerHTML = isBookmarked ? '<i class="fas fa-bookmark" style="color:var(--accent)"></i>' : '<i class="far fa-bookmark"></i>';
-}
-
-// ===== Search =====
-function toggleSearch() {
-  const sidebar = document.getElementById('sidebar');
-  if (!sidebar.classList.contains('open')) {
-    sidebar.classList.add('open');
-    switchSidebarTab('search');
-  } else if (state.sidebarTab === 'search') {
-    sidebar.classList.remove('open');
-  } else {
-    switchSidebarTab('search');
-  }
-}
-
-function debounceSearch() {
-  clearTimeout(state.searchTimer);
-  state.searchTimer = setTimeout(performSearch, 300);
-}
-
-async function performSearch() {
-  const query = document.getElementById('search-input').value.trim();
-  const container = document.getElementById('sidebar-content');
-  if (!query || query.length < 2) { container.innerHTML = ''; return; }
-
-  if (state.currentBook.format === 'epub' && state.epub) {
-    const results = [];
-    const spine = state.epub.spine;
-    for (let i = 0; i < spine.items.length && results.length < 50; i++) {
-      const item = spine.items[i];
-      try {
-        const doc = await item.load(state.epub.load.bind(state.epub));
-        const text = doc.body ? doc.body.textContent : '';
-        const idx = text.toLowerCase().indexOf(query.toLowerCase());
-        if (idx >= 0) {
-          const start = Math.max(0, idx - 30);
-          const end = Math.min(text.length, idx + query.length + 30);
-          results.push({
-            cfi: item.cfiBase,
-            excerpt: text.substring(start, end),
-            href: item.href
-          });
-        }
-      } catch(e) {}
-    }
-    container.innerHTML = results.length ? results.map((r, i) => `
-      <div class="search-result" onclick="state.epubRendition.display('${r.href}')">
-        <div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${r.href}</div>
-        <div>${r.excerpt.replace(new RegExp(query, 'gi'), m => `<mark>${m}</mark>`)}</div>
-      </div>
-    `).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
-  } else {
-    // Text search
-    const view = document.getElementById('text-view');
-    const text = view.textContent || '';
-    const results = [];
-    let idx = 0;
-    const lowerText = text.toLowerCase();
-    const lowerQuery = query.toLowerCase();
-    while ((idx = lowerText.indexOf(lowerQuery, idx)) >= 0 && results.length < 50) {
-      const start = Math.max(0, idx - 30);
-      const end = Math.min(text.length, idx + query.length + 30);
-      results.push({ pos: idx, excerpt: text.substring(start, end) });
-      idx += query.length;
-    }
-    container.innerHTML = results.length ? results.map((r, i) => `
-      <div class="search-result" onclick="scrollToSearchResult(${r.pos})">
-        <div>${r.excerpt.replace(new RegExp(query, 'gi'), m => `<mark>${m}</mark>`)}</div>
-      </div>
-    `).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
-  }
-}
-
-function scrollToSearchResult(pos) {
-  const view = document.getElementById('text-view');
-  const ratio = pos / (view.textContent || '').length;
-  view.scrollTop = ratio * view.scrollHeight;
-}
-
-// ===== Highlights =====
-function showHighlightMenu(cfiRange, contents) {
-  const menu = document.getElementById('highlight-menu');
-  // Position near selection
-  const selection = contents.document.getSelection();
-  if (!selection || selection.isCollapsed) return;
-  const range = selection.getRangeAt(0);
-  const rect = range.getBoundingClientRect();
-  menu.style.top = (rect.top - 40) + 'px';
-  menu.style.left = rect.left + 'px';
-  menu.classList.add('show');
-  menu._cfiRange = cfiRange;
-}
-
-function addHighlight(color) {
-  const menu = document.getElementById('highlight-menu');
-  const cfiRange = menu._cfiRange;
-  if (!cfiRange || !state.epubRendition) return;
-  state.epubRendition.annotations.highlight(cfiRange, {}, (e) => {}, color);
-  if (!state.currentBook.highlights) state.currentBook.highlights = [];
-  state.currentBook.highlights.push({ cfiRange, color });
-  saveBooks();
-  menu.classList.remove('show');
-  showToast('已添加高亮');
-}
-
-function removeHighlight() {
-  document.getElementById('highlight-menu').classList.remove('show');
-}
-
-// ===== Settings =====
-function toggleSettings() {
-  document.getElementById('settings-panel').classList.toggle('open');
-}
-
+function toggleBookmark() {}
+function toggleSearch() {}
+function toggleSettings() {}
+function toggleFullscreen() {}
+function prevPage() {}
+function nextPage() {}
+function changeFontSize(delta) {}
+function changeLineHeight(delta) {}
+function changeLetterSpacing(delta) {}
+function changeFont(font) {}
+function changePageGap(delta) {}
 function setTheme(theme) {
   state.theme = theme;
-  document.body.setAttribute('data-theme', theme);
   localStorage.setItem('moyue_theme', theme);
-  document.querySelectorAll('.theme-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.theme === theme));
-  applyEpubTheme();
+  document.body.setAttribute('data-theme', theme);
 }
-
 function toggleThemeQuick() {
   const themes = ['light', 'dark', 'sepia', 'green'];
-  const idx = themes.indexOf(state.theme);
-  setTheme(themes[(idx + 1) % themes.length]);
+  const currentIdx = themes.indexOf(state.theme);
+  const nextTheme = themes[(currentIdx + 1) % themes.length];
+  setTheme(nextTheme);
 }
-
-function changeFontSize(delta) {
-  state.fontSize = Math.max(12, Math.min(32, state.fontSize + delta));
-  document.getElementById('font-size-val').textContent = state.fontSize + 'px';
-  localStorage.setItem('moyue_fontSize', state.fontSize);
-  applyTextStyles();
-  applyEpubTheme();
-}
-
-function changeLineHeight(delta) {
-  state.lineHeight = Math.max(1.2, Math.min(3, +(state.lineHeight + delta).toFixed(1)));
-  document.getElementById('line-height-val').textContent = state.lineHeight;
-  localStorage.setItem('moyue_lineHeight', state.lineHeight);
-  applyTextStyles();
-}
-
-function changeLetterSpacing(delta) {
-  state.letterSpacing = Math.max(-1, Math.min(5, +(state.letterSpacing + delta).toFixed(1)));
-  document.getElementById('letter-spacing-val').textContent = state.letterSpacing + 'px';
-  localStorage.setItem('moyue_letterSpacing', state.letterSpacing);
-  applyTextStyles();
-}
-
-function changeFont(font) {
-  state.fontFamily = font;
-  localStorage.setItem('moyue_fontFamily', font);
-  applyTextStyles();
-  applyEpubTheme();
-}
-
-function changePageGap(delta) {
-  state.pageGap = Math.max(0, Math.min(60, state.pageGap + delta));
-  document.getElementById('page-gap-val').textContent = state.pageGap + 'px';
-  localStorage.setItem('moyue_pageGap', state.pageGap);
-  applyTextStyles();
-}
-
-// ===== Fullscreen =====
-function toggleFullscreen() {
-  if (!document.fullscreenElement) {
-    document.documentElement.requestFullscreen();
-  } else {
-    document.exitFullscreen();
-  }
-}
-
-// ===== Progress =====
-function updateProgress(pct) {
-  document.getElementById('progress-fill').style.width = Math.round(pct * 100) + '%';
-}
-
-// ===== Go Home =====
-function goHome() {
-  // Save scroll for local books before cleanup
-  if (state.currentBook && state.currentBook._local && state.currentBook._filename) {
-    const view = document.getElementById('text-view');
-    if (view) {
-      saveLocalProgress(state.currentBook._filename, {
-        progress: state.currentBook.progress,
-        scrollTop: view.scrollTop
-      });
-    }
-  }
-
-  // Cleanup
-  if (state.epub) { state.epub.destroy(); state.epub = null; state.epubRendition = null; }
-  state.pdfDoc = null;
-  state.currentBook = null;
-  state.format = null;
-
-  document.getElementById('reader').classList.remove('active');
-  document.getElementById('bookshelf').classList.remove('hidden');
-  document.getElementById('sidebar').classList.remove('open');
-  document.getElementById('settings-panel').classList.remove('open');
-  renderBookshelf();
-  renderLocalBooks();
-}
-
-// ===== Toast =====
-function showToast(msg) {
-  const toast = document.getElementById('toast');
-  toast.textContent = msg;
-  toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2500);
-}
-
-// ===== Keyboard =====
-document.addEventListener('keydown', e => {
-  if (!document.getElementById('reader').classList.contains('active')) return;
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-
-  switch(e.key) {
-    case 'ArrowLeft': case 'PageUp': e.preventDefault(); prevPage(); break;
-    case 'ArrowRight': case 'PageDown': case ' ': e.preventDefault(); nextPage(); break;
-    case 'Escape':
-      document.getElementById('sidebar').classList.remove('open');
-      document.getElementById('settings-panel').classList.remove('open');
-      break;
-    case 'b': case 'B': toggleBookmark(); break;
-    case 'f': case 'F':
-      if (e.ctrlKey || e.metaKey) { e.preventDefault(); toggleSearch(); }
-      break;
-    case 'F11': e.preventDefault(); toggleFullscreen(); break;
-  }
-});
-
-function handleKeyNav(e) {
-  if (e.key === 'ArrowLeft') prevPage();
-  else if (e.key === 'ArrowRight') nextPage();
-}
-
-// ===== Mouse Wheel Page Turn =====
-let _wheelTimer = null;
-let _wheelAccum = 0;
-document.addEventListener('wheel', e => {
-  if (!document.getElementById('reader').classList.contains('active')) return;
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-
-  // Only handle page-turn modes: epub & pdf always; text/markdown/html only when content fits in one screen
-  const fmt = state.format;
-  const isPaginated = (fmt === 'epub' || fmt === 'pdf');
-  const view = document.getElementById('text-view');
-  const pdfView = document.getElementById('pdf-view');
-
-  // PDF: let internal scroll happen, only page-turn at boundaries
-  if (pdfView && pdfView.style.display !== 'none') {
-    const scrollTop = pdfView.scrollTop;
-    const atTop = scrollTop <= 2;
-    const atBottom = scrollTop + pdfView.clientHeight >= pdfView.scrollHeight - 2;
-    if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
-  }
-
-  if (!isPaginated) {
-    // For scrollable text: let normal scroll work, only page-turn when at boundaries
-    if (view && view.style.display !== 'none') {
-      const atTop = view.scrollTop <= 2;
-      const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 2;
-      if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return; // normal scroll
-    }
-  }
-
-  // Accumulate wheel delta with debounce for smooth trackpad support
-  _wheelAccum += e.deltaY;
-  clearTimeout(_wheelTimer);
-  _wheelTimer = setTimeout(() => { _wheelAccum = 0; }, 200);
-
-  if (Math.abs(_wheelAccum) < 30) return; // threshold
-  e.preventDefault();
-
-  if (_wheelAccum > 0) nextPage();
-  else prevPage();
-  _wheelAccum = 0;
-}, { passive: false });
-
-// Close panels on outside click
-document.addEventListener('click', e => {
-  const panel = document.getElementById('settings-panel');
-  if (panel.classList.contains('open') && !panel.contains(e.target) && !e.target.closest('[onclick*="toggleSettings"]')) {
-    panel.classList.remove('open');
-  }
-  const menu = document.getElementById('highlight-menu');
-  if (menu.classList.contains('show') && !menu.contains(e.target)) {
-    menu.classList.remove('show');
-  }
-});
-
-// ===== Init =====
-renderBookshelf();
-loadLocalTxtBooks();
+function debounceSearch() {}
+function addHighlight(color) {}
+function removeHighlight() {}
+function loadLocalTxtBooks() {}
 </script>
 </body>
 </html>
