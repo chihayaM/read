@@ -1,1 +1,20 @@
 
+{
+  "books": [
+    {
+      "name": "告别世界的最佳方式",
+      "file": "告别世界的最佳方式 (辻村深月) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size": 685522
+    },
+    {
+      "name": "太古和其他的时间",
+      "file": "太古和其他的时间 (奥尔加·托卡尔丘克) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size": 407769
+    },
+    {
+      "name": "昨日的世界",
+      "file": "昨日的世界 (【奥】斯特凡·茨威格, 徐友敬) (z-library.sk, 1lib.sk, z-lib.sk).epub",
+      "size": 529288
+    }
+  ]
+}
