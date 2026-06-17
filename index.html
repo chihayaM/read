@@ -596,6 +596,8 @@ input, button, select { font-family: inherit; }
   top: 48px;
   right: 16px;
   width: 320px;
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
   background: var(--card-bg);
   border-radius: 12px;
   box-shadow: 0 8px 32px var(--shadow);
@@ -998,6 +1000,9 @@ kbd {
 <div class="toast" id="toast"></div>
 
 <script>
+// ===== Helpers =====
+function escapeRegExp(str) { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
 // ===== State =====
 const state = {
   books: JSON.parse(localStorage.getItem('moyue_books') || '[]'),
@@ -1109,7 +1114,7 @@ async function loadLocalTxtBooks() {
       // GitHub Pages 不支持目录列表，用 API 兜底
       if (!dirHtml || dirHtml.length < 200) {
         try {
-          const apiResp = await fetch('https://api.github.com/repos/chihayaM/read/contents/txt');
+          const apiResp = await fetch('https://api.github.com/repos/chihayaM/fufureader/contents/txt');
           if (apiResp.ok) {
             const files = await apiResp.json();
             for (const f of files) {
@@ -1193,11 +1198,11 @@ async function extractLocalCover(item) {
     const book = ePub(ab);
     await book.ready;
     const coverUrl = await book.coverUrl();
-    book.destroy();
     if (coverUrl) {
-      // blob URL 会在 destroy 后失效，转成 data URL 再缓存
+      // blob URL 会在 destroy 后失效，先 fetch 再 destroy
       const imgResp = await fetch(coverUrl);
       const blob = await imgResp.blob();
+      book.destroy();
       const dataUrl = await new Promise(resolve => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
@@ -1228,7 +1233,8 @@ function renderLocalBooks() {
     const coverHtml = cachedCover
       ? `<img src="${cachedCover}" alt="">`
       : `<div class="placeholder" style="background:linear-gradient(135deg,${color},${color}dd)">${ext}</div>`;
-    return `<div class="book-card" onclick="openLocalBook('${filename}')"><div class="book-cover">${coverHtml}<span class="local-book-badge"><i class="fas fa-folder"></i></span></div><div class="book-info"><div class="title" title="${cleanTitle}">${cleanTitle}</div><div class="meta"><span>${item.author || '本地'}</span><span>${progress}%</span></div><div class="book-progress-bar" style="width:${progress}%"></div></div></div>`;
+    const safeFilename = filename.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    return `<div class="book-card" onclick="openLocalBook('${safeFilename}')"><div class="book-cover">${coverHtml}<span class="local-book-badge"><i class="fas fa-folder"></i></span></div><div class="book-info"><div class="title" title="${cleanTitle}">${cleanTitle}</div><div class="meta"><span>${item.author || '本地'}</span><span>${progress}%</span></div><div class="book-progress-bar" style="width:${progress}%"></div></div></div>`;
   }).join('');
   // 异步提取未缓存的封面
   state.localBooks.forEach(async (item, i) => {
@@ -1293,6 +1299,22 @@ async function openLocalBook(filename) {
       } else {
         book.data = await item._blob.text();
       }
+    } else if (item.file && item.file.startsWith('__imported__/')) {
+      // 从 IndexedDB 恢复导入的文件
+      const dbId = 'local_' + filename;
+      try {
+        const data = await dbGet(dbId);
+        if (data) {
+          book.data = data;
+          book.size = data instanceof ArrayBuffer ? data.byteLength : data.length;
+        } else {
+          throw new Error('IndexedDB 中未找到数据');
+        }
+      } catch(err) {
+        showLoading(false);
+        showToast('导入的文件数据丢失，请重新导入: ' + filename);
+        return;
+      }
     } else {
       const resp = await fetch(item.file);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1342,12 +1364,22 @@ document.addEventListener('DOMContentLoaded', () => {
     folderInput.addEventListener('change', async (e) => {
       const files = Array.from(e.target.files);
       if (files.length === 0) return;
+      showLoading(true);
       let count = 0;
       for (const file of files) {
         const ext = file.name.split('.').pop().toLowerCase();
         if (!['epub','pdf','txt','md','markdown','html','htm','fb2','rtf','log','csv','json','xml'].includes(ext)) continue;
+        const id = 'local_' + file.name;
+        try {
+          // 存入 IndexedDB 以持久化
+          if (['epub','pdf'].includes(ext)) {
+            await dbPut(id, await file.arrayBuffer());
+          } else {
+            await dbPut(id, await file.text());
+          }
+        } catch(err) { console.warn('保存导入文件失败:', file.name, err); }
         state.localBooksMap[file.name] = {
-          file: null,
+          file: `__imported__/${file.name}`,
           title: file.name.replace(/\.(txt|md|markdown|log)$/i, ''),
           author: '导入',
           ext,
@@ -1363,7 +1395,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         count++;
       }
+      showLoading(false);
       if (count > 0) {
+        // 保存导入书目列表到 localStorage
+        const imported = state.localBooks.filter(b => b.file.startsWith('__imported__/'));
+        localStorage.setItem('moyue_imported_books', JSON.stringify(imported));
         renderLocalBooks();
         document.getElementById('local-status').textContent = `${count} 本`;
         showToast(`已导入 ${count} 个文件`);
@@ -1419,7 +1455,16 @@ async function processFile(file) {
     try {
       const book = ePub(_arrayBuffer);
       await book.ready;
-      cover = await book.coverUrl();
+      const coverUrl = await book.coverUrl();
+      if (coverUrl) {
+        const imgResp = await fetch(coverUrl);
+        const blob = await imgResp.blob();
+        cover = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+      }
       book.destroy();
     } catch(e) { console.warn('EPUB cover extraction failed:', e); }
   }
@@ -1608,8 +1653,6 @@ async function openEpub(book) {
 
   if (book.location) {
     await state.epubRendition.display(book.location);
-  } else if (book.progress > 0) {
-    await state.epubRendition.display(book.progress);
   } else {
     await state.epubRendition.display();
   }
@@ -1653,7 +1696,25 @@ async function openEpub(book) {
   state.epubRendition.on('rendered', (section, view) => {
     try {
       const doc = view.document || (view.iframe && view.iframe.contentDocument);
-      if (doc) doc.addEventListener('wheel', epubWheelHandler, { passive: false });
+      if (doc) {
+        doc.addEventListener('wheel', epubWheelHandler, { passive: false });
+        // EPUB iframe 内触摸滑动翻页
+        let _epubTouchX = 0, _epubTouchY = 0, _epubTouchTime = 0;
+        doc.addEventListener('touchstart', e => {
+          _epubTouchX = e.touches[0].clientX;
+          _epubTouchY = e.touches[0].clientY;
+          _epubTouchTime = Date.now();
+        }, { passive: true });
+        doc.addEventListener('touchend', e => {
+          const dx = e.changedTouches[0].clientX - _epubTouchX;
+          const dy = e.changedTouches[0].clientY - _epubTouchY;
+          const dt = Date.now() - _epubTouchTime;
+          if (Math.abs(dx) > 50 && dt < 500 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+            if (dx < 0) nextPage();
+            else prevPage();
+          }
+        }, { passive: true });
+      }
     } catch(e) {}
   });
 
@@ -1683,9 +1744,24 @@ state.epubCurrentTheme = state.theme;
 function applyEpubTheme() {
   if (!state.epubRendition) return;
   state.epubCurrentTheme = state.theme;
-  // 刷新当前页以应用新主题
-  const loc = state.epubRendition.currentLocation();
-  if (loc && loc.start) state.epubRendition.display(loc.start.cfi);
+  // 直接更新 iframe 内的样式，避免整页重载闪烁
+  const c = state.epubThemeColors[state.theme] || state.epubThemeColors.light;
+  const view = document.getElementById('epub-view');
+  const iframe = view ? view.querySelector('iframe') : null;
+  if (iframe && iframe.contentDocument) {
+    const styleEl = iframe.contentDocument.getElementById('moyue-theme');
+    if (styleEl) {
+      const fs = state.fontSize || 16;
+      const lh = state.lineHeight || 1.8;
+      const ls = state.letterSpacing || 0;
+      const ff = state.fontFamily || 'system-ui, sans-serif';
+      const indent = state.firstLineIndent || 0;
+      const paraSpace = state.paragraphSpacing || 1;
+      const gapV = state.pageGapV || 0;
+      const gapH = state.pageGapH || 0;
+      styleEl.textContent = `body{background:${c.bg}!important;color:${c.fg}!important;padding:${gapV}px ${gapH}px!important;font-size:${fs}px!important;line-height:${lh}!important;letter-spacing:${ls}px!important;font-family:${ff}!important}a:link,a:hover,a:active{color:${c.link}!important}img,video,svg{max-width:100%;height:auto}p{text-indent:${indent}em!important;margin-bottom:${paraSpace}em!important}`;
+    }
+  }
 }
 
 function renderToc(toc, level = 0) {
@@ -1862,11 +1938,20 @@ function openHtml(book) {
   view.style.display = 'block';
   view.className = '';
   let html = book.data;
+  // 更完整的 XSS 过滤
   html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
-  html = html.replace(/\son\w+\s*=\s*(["'])[\s\S]*?\1/gi, '');
-  html = html.replace(/\son\w+\s*=\s*[^\s>]*/gi, '');
-  html = html.replace(/href\s*=\s*["']?\s*javascript:/gi, 'href="#" data-blocked="');
-  html = html.replace(/src\s*=\s*["']?\s*javascript:/gi, 'src="" data-blocked="');
+  html = html.replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
+  html = html.replace(/<object[\s\S]*?<\/object>/gi, '');
+  html = html.replace(/<embed[^>]*>/gi, '');
+  html = html.replace(/<applet[\s\S]*?<\/applet>/gi, '');
+  html = html.replace(/<form[\s\S]*?<\/form>/gi, '');
+  // 移除所有 on* 事件属性
+  html = html.replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  // 移除 javascript:/vbscript:/data: 协议
+  html = html.replace(/(?:href|src|action|formaction|data|background)\s*=\s*["']?\s*(?:javascript|vbscript|data):/gi, 'data-blocked="');
+  // 移除 style 中的 expression()
+  html = html.replace(/style\s*=\s*"[^"]*expression\s*\(/gi, 'style="');
+  html = html.replace(/style\s*=\s*'[^']*expression\s*\(/gi, "style='");
   view.innerHTML = html;
   applyTextStyles();
   restoreScroll(book);
@@ -1934,7 +2019,7 @@ function applyTextStyles() {
 
 function saveTextProgress(view) {
   if (!state.currentBook) return;
-  const pct = view.scrollTop / (view.scrollHeight - view.clientHeight);
+  const pct = view.scrollTop / (view.scrollHeight - view.clientHeight || 1);
   state.currentBook.progress = Math.min(1, Math.max(0, pct));
   updateProgress(state.currentBook.progress);
   state.currentBook._scrollTop = view.scrollTop;
@@ -1950,7 +2035,7 @@ function saveTextProgress(view) {
 function restoreScroll(book) {
   const view = document.getElementById('text-view');
   if (book._scrollTop) { setTimeout(() => view.scrollTop = book._scrollTop, 50); }
-  else if (book.progress > 0) { setTimeout(() => view.scrollTop = book.progress * (view.scrollHeight - view.clientHeight), 50); }
+  else if (book.progress > 0) { setTimeout(() => view.scrollTop = book.progress * (view.scrollHeight - view.clientHeight || 1), 50); }
 }
 
 function generateTextToc(container) {
@@ -2020,7 +2105,13 @@ function toggleBookmark() {
   } else {
     const view = document.getElementById('text-view');
     const pct = book.progress || 0;
-    book.bookmarks.push({ progress: pct, scrollTop: view.scrollTop, title: '位置 ' + Math.round(pct*100) + '%', text: '', time: Date.now() });
+    // 截取当前可见区域的前100字作为上下文
+    const scrollTop = view.scrollTop;
+    const visibleText = view.textContent || '';
+    const charRatio = scrollTop / (view.scrollHeight || 1);
+    const startIdx = Math.max(0, Math.floor(charRatio * visibleText.length));
+    const excerpt = visibleText.substring(startIdx, startIdx + 100).replace(/\s+/g, ' ').trim();
+    book.bookmarks.push({ progress: pct, scrollTop, title: '位置 ' + Math.round(pct*100) + '%', text: excerpt, time: Date.now() });
     showToast('已添加书签');
   }
   saveBooks();
@@ -2034,7 +2125,7 @@ function goToBookmark(index) {
   if (book.format === 'epub' && bm.cfi) { state.epubRendition.display(bm.cfi); }
   else if (bm.progress !== undefined) {
     if (book.format === 'pdf') { renderPdfPage(Math.max(1, Math.round(bm.progress * state.pdfDoc.numPages))); }
-    else { const view = document.getElementById('text-view'); view.scrollTop = bm.scrollTop || (bm.progress * (view.scrollHeight - view.clientHeight)); }
+    else { const view = document.getElementById('text-view'); view.scrollTop = bm.scrollTop || (bm.progress * (view.scrollHeight - view.clientHeight || 1)); }
   }
 }
 
@@ -2067,7 +2158,7 @@ function toggleSearch() {
 
 function debounceSearch() {
   clearTimeout(state.searchTimer);
-  state.searchTimer = setTimeout(performSearch, 30);
+  state.searchTimer = setTimeout(performSearch, 300);
 }
 
 async function performSearch() {
@@ -2091,7 +2182,7 @@ async function performSearch() {
         }
       } catch(e) {}
     }
-    container.innerHTML = results.length ? results.map((r, i) => `<div class="search-result" onclick="state.epubRendition.display('${r.href}')"><div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${r.href}</div><div>${r.excerpt.replace(new RegExp(query, 'gi'), m => `<mark>${m}</mark>`)}</div></div>`).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
+    container.innerHTML = results.length ? results.map((r, i) => `<div class="search-result" onclick="state.epubRendition.display('${r.href}')"><div style="font-size:11px;color:var(--text-secondary);margin-bottom:2px">${r.href}</div><div>${r.excerpt.replace(new RegExp(escapeRegExp(query), 'gi'), m => `<mark>${m}</mark>`)}</div></div>`).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
   } else {
     const view = document.getElementById('text-view');
     const text = view.textContent || '';
@@ -2105,7 +2196,7 @@ async function performSearch() {
       results.push({ pos: idx, excerpt: text.substring(start, end) });
       idx += query.length;
     }
-    container.innerHTML = results.length ? results.map((r, i) => `<div class="search-result" onclick="scrollToSearchResult(${r.pos})"><div>${r.excerpt.replace(new RegExp(query, 'gi'), m => `<mark>${m}</mark>`)}</div></div>`).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
+    container.innerHTML = results.length ? results.map((r, i) => `<div class="search-result" onclick="scrollToSearchResult(${r.pos})"><div>${r.excerpt.replace(new RegExp(escapeRegExp(query), 'gi'), m => `<mark>${m}</mark>`)}</div></div>`).join('') : '<div class="empty-state"><p>未找到结果</p></div>';
   }
 }
 
@@ -2391,9 +2482,39 @@ document.getElementById('content-area').addEventListener('click', e => {
   else prevPage();
 });
 
+// 移动端触摸滑动翻页
+let _touchStartX = 0, _touchStartY = 0, _touchStartTime = 0;
+document.getElementById('content-area').addEventListener('touchstart', e => {
+  _touchStartX = e.touches[0].clientX;
+  _touchStartY = e.touches[0].clientY;
+  _touchStartTime = Date.now();
+}, { passive: true });
+document.getElementById('content-area').addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - _touchStartX;
+  const dy = e.changedTouches[0].clientY - _touchStartY;
+  const dt = Date.now() - _touchStartTime;
+  // 水平滑动距离>50px、时间<500ms、水平位移>垂直位移
+  if (Math.abs(dx) > 50 && dt < 500 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    if (dx < 0) nextPage();
+    else prevPage();
+  }
+}, { passive: true });
+
 // ===== Init =====
 renderBookshelf();
 loadLocalTxtBooks();
+// 恢复导入的书目
+try {
+  const imported = JSON.parse(localStorage.getItem('moyue_imported_books') || '[]');
+  for (const item of imported) {
+    const filename = item.file.split('/').pop();
+    if (!state.localBooks.find(b => b.file.split('/').pop() === filename)) {
+      state.localBooks.push(item);
+      state.localBooksMap[filename] = { ...item, _blob: null };
+    }
+  }
+  if (imported.length > 0) renderLocalBooks();
+} catch {}
 // 同步设置面板显示值
 document.getElementById('font-size-val').value = state.fontSize;
 document.getElementById('line-height-val').value = state.lineHeight;
